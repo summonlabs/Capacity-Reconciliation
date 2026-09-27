@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Summon Software Labs.
+#
+# Every file in this repository is a text file, and every one of them is stored
+# and checked out with LF endings. Pinning the endings here means a checkout is
+# byte-identical whatever `core.autocrlf` happens to be set to on the machine
+# doing the checkout, which is what makes the published run digests and the
+# packaging proof reproducible.
+
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.gz binary
+*.lib binary
+*.exe binary
+*.dll binary
+*.pdb binary

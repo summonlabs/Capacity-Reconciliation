@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Summon Software Labs.
+
+# Build trees
+build/
+out/
+cmake-build-*/
+
+# Visual Studio / MSVC intermediates
+.vs/
+*.vcxproj*
+*.sln
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+_deps/
+Testing/
+
+# Local scratch: capacity stores, benchmark data, scratch checkouts
+*.crstore/
+store/
+scratch/

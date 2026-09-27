@@ -1,0 +1,45 @@
+Capacity Reconciliation
+
+Copyright 2026 Summon Software Labs
+
+Capacity Reconciliation is an open-source, vendor-neutral runtime for
+deterministic reconciliation and discrepancy classification across planned,
+reserved, installed, observed, usable and allocatable facility capacity views.
+It is built from the C++20 standard library only.
+
+This product is licensed under the Apache License, Version 2.0. See the
+LICENSE file in this distribution for the full license text.
+
+Capacity Reconciliation does not collect or transmit any telemetry. It makes no
+network connection of any kind. Every byte it writes goes to the local store
+directory the operator names on the command line or passes to the library, and
+nothing leaves the machine running the software.
+
+Capacity Reconciliation accepts contributions from individuals and organizations
+on the terms of the Apache License 2.0 without requiring a Contributor License
+Agreement (CLA). See CONTRIBUTING.md for contribution guidance.
+
+Third-party components
+----------------------
+
+None. No third-party source code, library, header or generated artefact is
+included in, linked into, or required by this product.
+
+The build depends only on the platform's own toolchain and operating system:
+
+  * the C++20 standard library of the toolchain that builds the project;
+  * the operating system's cryptographic random generator, used for identity
+    and store-identity entropy and reached through the platform API
+    (BCryptGenRandom on Windows, the platform entropy source elsewhere);
+  * the operating system's file, locking and durability primitives, used for
+    the durable store and for writer fencing.
+
+No network service, telemetry endpoint, analytics library or runtime package
+manager is contacted or required at build time or at run time.
+
+Trademarks
+----------
+
+All product names, trademarks and registered trademarks mentioned in this
+repository are the property of their respective owners and are used only for
+identification purposes.
