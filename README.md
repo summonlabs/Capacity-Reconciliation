@@ -7,8 +7,7 @@ Capacity Reconciliation is a Summon Software Labs runtime for one question:
 > unexplained, and which evidence is authoritative enough to drive the next
 > decision?**
 
-It is repository 16 of the 72-runtime Data Center Control Plane (DCCP), in
-Tranche 2: Facility Capacity and Placement. Version 1.0.0. Portable C++20, CMake,
+Version 1.0.0. Portable C++20, CMake,
 no third-party runtime dependency, no GUI, no telemetry.
 
 The short answer the runtime gives is a *reconciliation run*: an immutable,
