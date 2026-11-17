@@ -503,6 +503,12 @@ Result<ReconciliationRun> Engine::reconcile(const RunRequest& request) const {
 
 Result<ReconciliationRun> Engine::reconcile_and_commit(const RunRequest& request, Generation expected,
                                                        const IncarnationId& expected_incarnation) {
+  return commit_run(request, expected, expected_incarnation, nullptr);
+}
+
+Result<ReconciliationRun> Engine::commit_run(const RunRequest& request, Generation expected,
+                                             const IncarnationId& expected_incarnation,
+                                             const ReconciliationRunId* supersedes) {
   if (!(expected == generation())) {
     return generation_mismatch(expected.value(), generation().value());
   }
@@ -519,29 +525,34 @@ Result<ReconciliationRun> Engine::reconcile_and_commit(const RunRequest& request
   }
 
   HistoryEntry event;
+  HistoryEntry superseded_event;
   {
     std::lock_guard<std::mutex> guard(mutex_);
     if (stale_incarnation(expected_incarnation)) {
       return make_error(ErrorCode::StaleAuthority,
                         "the caller holds an incarnation that is no longer current", "incarnation");
     }
-    if (runs_.size() >= options_.max_runs_retained) {
+    // The successor set of runs is built beside the retained one and adopted
+    // only once it is committed. Retiring a run from the retained set first
+    // meant that a commit which then failed had still discarded that run.
+    std::vector<ReconciliationRun> next_runs = runs_;
+    if (next_runs.size() >= options_.max_runs_retained) {
       // Retire the oldest run that no other retained run names as its parent,
       // so lineage never dangles.
       bool retired = false;
-      for (auto it = runs_.begin(); it != runs_.end(); ++it) {
+      for (auto it = next_runs.begin(); it != next_runs.end(); ++it) {
         // A run is retained when another run names it as its parent, and also
         // when the run about to be added names it: retiring the predecessor of
         // the run being committed would leave the lineage dangling.
         bool referenced = request.parent_run.has_value() && *request.parent_run == it->id();
-        for (const ReconciliationRun& other : runs_) {
+        for (const ReconciliationRun& other : next_runs) {
           if (other.request().parent_run.has_value() && *other.request().parent_run == it->id()) {
             referenced = true;
             break;
           }
         }
         if (!referenced) {
-          runs_.erase(it);
+          next_runs.erase(it);
           retired = true;
           break;
         }
@@ -559,6 +570,33 @@ Result<ReconciliationRun> Engine::reconcile_and_commit(const RunRequest& request
     run.set_commit_attempt(attempt());
     run.set_committed_generation(committed_generation.value());
 
+    if (supersedes != nullptr) {
+      // The predecessor is superseded by the commit that adds its successor.
+      // Committed on its own afterwards, a failure between the two commits left
+      // a successor whose predecessor still claimed to be current, and a retry
+      // gave that predecessor a second successor.
+      bool found = false;
+      for (ReconciliationRun& candidate : next_runs) {
+        if (candidate.id() == *supersedes) {
+          candidate.set_resolution(ResolutionState::Superseded);
+          candidate.set_superseded_by(run.id());
+          found = true;
+        }
+      }
+      if (!found) {
+        return make_error(ErrorCode::NotFound,
+                          "no run with identity " + supersedes->to_string(), "run_id");
+      }
+      superseded_event.kind = HistoryEventKind::RunSuperseded;
+      superseded_event.generation = expected;
+      superseded_event.attempt = attempt();
+      superseded_event.run = *supersedes;
+      superseded_event.related_run = run.id();
+      superseded_event.subject_digest = run.run_digest();
+      superseded_event.detail = history_detail("superseded_by_successor_run");
+    }
+    next_runs.push_back(run);
+
     event.kind = HistoryEventKind::RunComputed;
     event.generation = expected;
     event.attempt = attempt();
@@ -566,33 +604,46 @@ Result<ReconciliationRun> Engine::reconcile_and_commit(const RunRequest& request
     event.subject_digest = run.run_digest();
     event.detail = history_detail(std::string("resolution_") + to_string(run.resolution()));
 
+    StoreImage image;
+    StoreImage* staged = nullptr;
     if (store_.has_value()) {
-      StoreImage image = stage_image();
-      image.runs = runs_;
-      image.runs.push_back(run);
-      auto status = append_history(event, &image);
+      image = stage_image();
+      image.runs = next_runs;
+      staged = &image;
+    }
+    auto status = append_history(event, staged);
+    if (!status.ok()) {
+      return status.error();
+    }
+    if (supersedes != nullptr) {
+      status = append_history(superseded_event, staged);
       if (!status.ok()) {
+        append_history_rollback();
         return status.error();
       }
+    }
+    if (store_.has_value()) {
       auto committed = store_->mutate(expected, expected_incarnation, [&image](StoreImage& target) {
         target = image;
         return Status::success();
       });
       if (!committed.ok()) {
+        if (supersedes != nullptr) {
+          append_history_rollback();
+        }
         append_history_rollback();
         return committed.error();
       }
     } else {
-      auto status = append_history(event, nullptr);
-      if (!status.ok()) {
-        return status.error();
-      }
       generation_ = committed_generation.value();
     }
-    runs_.push_back(run);
+    runs_ = std::move(next_runs);
     last_stats_ = stats;
   }
   notify(event);
+  if (supersedes != nullptr) {
+    notify(superseded_event);
+  }
   return run;
 }
 
@@ -679,61 +730,7 @@ Result<ReconciliationRun> Engine::revalidate(ReconciliationRunId prior, Tick ins
   request.from_recovered_state = false;
   request.label = "revalidate";
 
-  auto successor = reconcile_and_commit(request, expected, expected_incarnation);
-  if (!successor.ok()) {
-    return successor.error();
-  }
-
-  HistoryEntry event;
-  {
-    std::lock_guard<std::mutex> guard(mutex_);
-    for (ReconciliationRun& run : runs_) {
-      if (run.id() == prior) {
-        run.set_resolution(ResolutionState::Superseded);
-        run.set_superseded_by(successor.value().id());
-      }
-    }
-    event.kind = HistoryEventKind::RunSuperseded;
-    event.run = prior;
-    event.related_run = successor.value().id();
-    event.subject_digest = successor.value().run_digest();
-    event.detail = history_detail("superseded_by_successor_run");
-
-    if (store_.has_value()) {
-      event.generation = store_->generation();
-      event.attempt = store_->attempt();
-      StoreImage image = stage_image();
-      image.runs = runs_;
-      auto status = append_history(event, &image);
-      if (!status.ok()) {
-        return status.error();
-      }
-      auto committed = store_->mutate(store_->generation(), store_->incarnation(),
-                                      [&image](StoreImage& target) {
-                                        target = image;
-                                        return Status::success();
-                                      });
-      if (!committed.ok()) {
-        append_history_rollback();
-        return committed.error();
-      }
-    } else {
-      event.generation = expected;
-      event.attempt = attempt();
-      auto status = append_history(event, nullptr);
-      if (!status.ok()) {
-        return status.error();
-      }
-      auto next = expected.next();
-      if (!next.ok()) {
-        append_history_rollback();
-        return next.error();
-      }
-      generation_ = next.value();
-    }
-  }
-  notify(event);
-  return successor;
+  return commit_run(request, expected, expected_incarnation, &prior);
 }
 
 Result<ReopenTicket> Engine::reopen(ReconciliationRunId prior, Tick instant, Generation expected,

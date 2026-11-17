@@ -186,6 +186,13 @@ class Engine {
   [[nodiscard]] Result<ReconciliationRun> compute(const RunRequest& request,
                                                   ReconcileStats* stats) const;
 
+  /// Compute a run and commit it in one durable generation. When `supersedes`
+  /// names a retained run, that run becomes Superseded by the new run in the
+  /// same commit.
+  [[nodiscard]] Result<ReconciliationRun> commit_run(const RunRequest& request, Generation expected,
+                                                     const IncarnationId& expected_incarnation,
+                                                     const ReconciliationRunId* supersedes);
+
   /// Assign the next sequence number to `entry`, record it, and (when durable)
   /// stage it into `image`. Takes the entry by reference so that the caller --
   /// and therefore the observer it notifies -- sees the assigned sequence.

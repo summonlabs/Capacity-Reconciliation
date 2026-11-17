@@ -1566,9 +1566,11 @@ Status Store::retire_records(const Limits& limits, RecoveryReport* report) {
     if (!payload.ok() || !(header.store_identity == image_.store_identity)) {
       continue;
     }
+    // A record that cannot be removed right now is left for a later pass. It is
+    // not a reason to refuse the open or the commit that triggered the cleanup.
     auto status = platform::remove_file_if_present(entry.second);
     if (!status.ok()) {
-      return status;
+      continue;
     }
     ++retired;
   }
@@ -1742,16 +1744,14 @@ Result<RecoveryReport> Store::commit(StoreImage successor, Generation expected,
   successor.generation = next_generation.value();
   successor.attempt = next_attempt.value();
   successor.incarnation = image_.incarnation;
-  successor.previous_record_digest = Digest{};
-  if (image_.generation.value() != 0) {
-    auto head_bytes = platform::read_file_bounded(Store::head_path(root_), kMaxHeadBytes);
-    if (head_bytes.ok()) {
-      auto head = decode_head(head_bytes.value());
-      if (head.ok()) {
-        successor.previous_record_digest = head.value().record_digest;
-      }
-    }
-  }
+  // The successor links to the record this handle holds. After a recovery from
+  // the previous commit that is not the record the manifest on disk names:
+  // linking to that manifest's digest made the first commit after a recovery
+  // fail its own chain check at the next open, which then found a fallback
+  // manifest that no longer matched its record either, and the store could not
+  // be opened at all.
+  successor.previous_record_digest =
+      image_.generation.value() != 0 ? recovery_.record_digest : Digest{};
   if (successor.clock_domain.empty()) {
     successor.clock_domain = image_.clock_domain;
   }
@@ -1881,7 +1881,17 @@ Result<RecoveryReport> Store::commit(StoreImage successor, Generation expected,
   const auto head_path = Store::head_path(root_);
   if (platform::is_regular_file_no_reparse(head_path)) {
     auto current = platform::read_file_bounded(head_path, kMaxHeadBytes);
+    // Only the manifest of the state this handle holds is kept as the fallback.
+    // After a recovery from the previous commit the manifest on disk is the one
+    // that failed; copying it over HEAD.prev would replace the one fallback
+    // that verifies with one that does not.
+    bool outgoing_is_held = false;
     if (current.ok()) {
+      auto outgoing = decode_head(current.value());
+      outgoing_is_held = outgoing.ok() && outgoing.value().generation == image_.generation &&
+                         outgoing.value().record_digest == recovery_.record_digest;
+    }
+    if (outgoing_is_held) {
       const auto staged_prev = staging / "HEAD.prev.next";
       status = platform::remove_file_if_present(staged_prev);
       if (!status.ok()) {
@@ -1910,23 +1920,22 @@ Result<RecoveryReport> Store::commit(StoreImage successor, Generation expected,
   }
 
   image_ = std::move(successor);
-
-  // Step 7: cleanup.
-  status = cleanup_staging(nullptr);
-  if (!status.ok()) {
-    return status.error();
-  }
   RecoveryReport report;
   report.outcome = RecoveryOutcome::OpenedClean;
   report.generation = image_.generation;
   report.attempt = image_.attempt;
   report.record_digest = header.payload_digest;
-  status = retire_records(limits_, &report);
-  if (!status.ok()) {
-    return status.error();
-  }
   recovery_ = report;
-  return report;
+
+  // Step 7: cleanup. The commit is published, so nothing from here on can fail
+  // it: residue, or an old record that cannot be removed right now because
+  // another process is reading it, is left for the next commit or open, which
+  // try again. Returning such a failure told the caller that a change which had
+  // been published had not happened.
+  (void)cleanup_staging(nullptr);
+  (void)retire_records(limits_, &report);
+  recovery_.records_retired = report.records_retired;
+  return recovery_;
 }
 
 Result<RecoveryReport> Store::advance_epoch(Generation expected,

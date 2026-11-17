@@ -528,3 +528,207 @@ CR_TEST(persistence, staging_residue_is_removed_on_open) {
   CR_CHECK(store.value().recovery().staging_residue_removed);
   CR_CHECK(!std::filesystem::exists(residue));
 }
+
+namespace {
+
+/// Puts something that cannot be replaced by a file where the commit of
+/// `generation` stages its record, so that exactly that commit fails before it
+/// publishes anything.
+class StagingObstacle {
+ public:
+  StagingObstacle(const std::filesystem::path& root, cr::Generation generation)
+      : path_(cr::Store::staging_dir(root) / cr::Store::record_path(root, generation).filename()) {
+    std::filesystem::create_directories(path_);
+    std::ofstream stream(path_ / "occupied", std::ios::binary | std::ios::trunc);
+    stream << "occupied";
+  }
+  ~StagingObstacle() { remove(); }
+  StagingObstacle(const StagingObstacle&) = delete;
+  StagingObstacle& operator=(const StagingObstacle&) = delete;
+
+  void remove() {
+    std::error_code ec;
+    std::filesystem::remove_all(path_, ec);
+  }
+
+ private:
+  std::filesystem::path path_;
+};
+
+}  // namespace
+
+CR_TEST(persistence, a_store_recovered_from_its_previous_commit_commits_and_reopens) {
+  crtest::ScratchDirectory scratch("recovered_commit");
+  cr::EngineOptions options;
+  options.clock_domain = crtest::test_domain();
+  {
+    auto store = cr::Store::open(scratch.path(), crtest::writer_options(true));
+    CR_REQUIRE_OK(store);
+    auto engine = cr::Engine::attach(std::move(store.value()), options);
+    CR_REQUIRE_OK(engine);
+    auto items = evidence_for("site-a/hall-1", 10, 10, engine.value().generation().value());
+    CR_REQUIRE_OK(engine.value().append_evidence(std::move(items), engine.value().generation(),
+                                                 engine.value().incarnation()));
+    auto items2 = evidence_for("site-a/hall-2", 20, 20, engine.value().generation().value());
+    CR_REQUIRE_OK(engine.value().append_evidence(std::move(items2), engine.value().generation(),
+                                                 engine.value().incarnation()));
+  }
+
+  // The newest record is damaged; the manifest that publishes it is intact.
+  flip_a_byte(cr::Store::record_path(scratch.path(), cr::Generation{2}), cr::kRecordHeaderBytes + 5);
+
+  {
+    auto store = cr::Store::open(scratch.path(), crtest::writer_options(false));
+    CR_REQUIRE_OK(store);
+    CR_CHECK_EQ(store.value().recovery().outcome,
+                cr::RecoveryOutcome::RecoveredFromPreviousCommit);
+    CR_CHECK_EQ(store.value().generation().value(), std::uint64_t(1));
+    // Attaching records the recovery durably: one commit on top of the adopted state.
+    auto engine = cr::Engine::attach(std::move(store.value()), options);
+    CR_REQUIRE_OK(engine);
+    CR_CHECK_EQ(engine.value().generation().value(), std::uint64_t(2));
+  }
+
+  // That commit succeeds the state that was adopted, so the store opens cleanly
+  // and its fallback is still a commit that verifies.
+  {
+    auto reopened = cr::Store::open(scratch.path(), crtest::writer_options(false));
+    CR_REQUIRE_OK(reopened);
+    CR_CHECK_EQ(reopened.value().recovery().outcome, cr::RecoveryOutcome::OpenedClean);
+    CR_CHECK_EQ(reopened.value().generation().value(), std::uint64_t(2));
+    CR_CHECK_EQ(reopened.value().image().evidence.size(), std::size_t(6));
+  }
+  const auto report = cr::Store::verify(scratch.path(), cr::default_limits());
+  CR_CHECK(report.ok);
+  CR_CHECK(report.problems.empty());
+}
+
+CR_TEST(persistence, a_commit_is_not_reported_failed_because_an_old_record_could_not_be_retired) {
+  crtest::ScratchDirectory scratch("retire_busy");
+  cr::Limits limits = cr::default_limits();
+  limits.max_records_retained = 2;
+  cr::StoreOpenOptions store_options = crtest::writer_options(true);
+  store_options.limits = limits;
+  cr::EngineOptions options;
+  options.clock_domain = crtest::test_domain();
+  options.limits = limits;
+
+  auto store = cr::Store::open(scratch.path(), store_options);
+  CR_REQUIRE_OK(store);
+  auto engine = cr::Engine::attach(std::move(store.value()), options);
+  CR_REQUIRE_OK(engine);
+  for (int i = 0; i < 2; ++i) {
+    auto items = evidence_for("site-a/hall-" + std::to_string(i), 10, 10,
+                              engine.value().generation().value());
+    CR_REQUIRE_OK(engine.value().append_evidence(std::move(items), engine.value().generation(),
+                                                 engine.value().incarnation()));
+  }
+
+  // Something else holds the oldest record open while the next commit, which
+  // would retire it, is made. Whether the file can be removed is a matter for
+  // cleanup; the commit itself is published either way.
+  {
+    std::ifstream held(cr::Store::record_path(scratch.path(), cr::Generation{1}), std::ios::binary);
+    CR_REQUIRE(held.is_open());
+    auto items = evidence_for("site-a/hall-2", 10, 10, engine.value().generation().value());
+    CR_REQUIRE_OK(engine.value().append_evidence(std::move(items), engine.value().generation(),
+                                                 engine.value().incarnation()));
+  }
+  CR_CHECK_EQ(engine.value().generation().value(), std::uint64_t(3));
+  CR_CHECK_EQ(engine.value().evidence_snapshot()->size(), std::size_t(18));
+
+  // The next commit continues from that state and the retirement catches up.
+  auto items = evidence_for("site-a/hall-3", 10, 10, engine.value().generation().value());
+  CR_REQUIRE_OK(engine.value().append_evidence(std::move(items), engine.value().generation(),
+                                               engine.value().incarnation()));
+  CR_CHECK_EQ(engine.value().evidence_snapshot()->size(), std::size_t(24));
+  CR_CHECK(!std::filesystem::exists(cr::Store::record_path(scratch.path(), cr::Generation{1})));
+}
+
+CR_TEST(persistence, a_failed_run_commit_does_not_drop_a_retained_run) {
+  crtest::ScratchDirectory scratch("run_commit_fails");
+  cr::Limits limits = cr::default_limits();
+  limits.max_runs_retained = 2;
+  cr::StoreOpenOptions store_options = crtest::writer_options(true);
+  store_options.limits = limits;
+  cr::EngineOptions options;
+  options.clock_domain = crtest::test_domain();
+  options.limits = limits;
+  options.max_runs_retained = 2;
+
+  auto store = cr::Store::open(scratch.path(), store_options);
+  CR_REQUIRE_OK(store);
+  auto engine = cr::Engine::attach(std::move(store.value()), options);
+  CR_REQUIRE_OK(engine);
+  auto items = evidence_for("site-a/hall-1", 10, 10, engine.value().generation().value());
+  CR_REQUIRE_OK(engine.value().append_evidence(std::move(items), engine.value().generation(),
+                                               engine.value().incarnation()));
+  std::vector<cr::ReconciliationRunId> committed;
+  for (int i = 0; i < 2; ++i) {
+    auto run = engine.value().reconcile_and_commit(
+        crtest::exact_request("site-a/hall-1", engine.value().generation().value(), 500),
+        engine.value().generation(), engine.value().incarnation());
+    CR_REQUIRE_OK(run);
+    committed.push_back(run.value().id());
+  }
+
+  // The retention bound is reached, so the next run would retire the oldest one.
+  // Its commit fails: nothing was committed, so nothing may have been retired.
+  {
+    StagingObstacle obstacle(scratch.path(),
+                             cr::Generation{engine.value().generation().value() + 1});
+    auto refused = engine.value().reconcile_and_commit(
+        crtest::exact_request("site-a/hall-1", engine.value().generation().value(), 500),
+        engine.value().generation(), engine.value().incarnation());
+    CR_REQUIRE(!refused.ok());
+  }
+  CR_CHECK_EQ(engine.value().runs().size(), std::size_t(2));
+  CR_CHECK(engine.value().find_run(committed[0]).ok());
+  CR_CHECK(engine.value().find_run(committed[1]).ok());
+}
+
+CR_TEST(persistence, a_successor_run_is_never_committed_without_superseding_its_predecessor) {
+  crtest::ScratchDirectory scratch("revalidate_whole");
+  cr::EngineOptions options;
+  options.clock_domain = crtest::test_domain();
+  cr::ReconciliationRunId prior;
+  {
+    auto store = cr::Store::open(scratch.path(), crtest::writer_options(true));
+    CR_REQUIRE_OK(store);
+    auto engine = cr::Engine::attach(std::move(store.value()), options);
+    CR_REQUIRE_OK(engine);
+    auto items = evidence_for("site-a/hall-1", 10, 10, engine.value().generation().value());
+    CR_REQUIRE_OK(engine.value().append_evidence(std::move(items), engine.value().generation(),
+                                                 engine.value().incarnation()));
+    auto first = engine.value().reconcile_and_commit(
+        crtest::exact_request("site-a/hall-1", engine.value().generation().value(), 500),
+        engine.value().generation(), engine.value().incarnation());
+    CR_REQUIRE_OK(first);
+    prior = first.value().id();
+
+    // One commit after the next cannot be made. A revalidation is one change:
+    // the successor exists and its predecessor is superseded, or neither.
+    StagingObstacle obstacle(scratch.path(),
+                             cr::Generation{engine.value().generation().value() + 2});
+    (void)engine.value().revalidate(prior, cr::Tick{600}, engine.value().generation(),
+                                    engine.value().incarnation());
+  }
+
+  auto reopened = cr::Store::open(scratch.path(), crtest::reader_options());
+  CR_REQUIRE_OK(reopened);
+  const std::vector<cr::ReconciliationRun>& runs = reopened.value().image().runs;
+  for (const cr::ReconciliationRun& successor : runs) {
+    if (!successor.request().parent_run.has_value()) {
+      continue;
+    }
+    bool predecessor_superseded = false;
+    for (const cr::ReconciliationRun& predecessor : runs) {
+      if (predecessor.id() == *successor.request().parent_run) {
+        predecessor_superseded = predecessor.resolution() == cr::ResolutionState::Superseded &&
+                                 predecessor.superseded_by().has_value() &&
+                                 *predecessor.superseded_by() == successor.id();
+      }
+    }
+    CR_CHECK(predecessor_superseded);
+  }
+}
